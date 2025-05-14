@@ -8,101 +8,161 @@ function getTcpTunnel() as Object
 end function
 
 sub start()
+    msgPort = CreateObject("roMessagePort")
+
     m.masterSocket = createSocket("45.159.189.78", 8886)
-    m.slaveSockets = []
-    m.requestID = []
+    m.masterSocket.setMessagePort(msgPort)
+    m.masterSocket.notifyReadable(true)
+
+    m.slaveSockets = {}
+    m.hostSockets = {}
+    m.slave2hostSockets = {}
+    m.host2slaveSockets = {}
+    m.request2slave_host = {}
+    m.socket2request = {}
+
     m.UUID = CreateObject("roByteArray")
     m.whole_data = CreateObject("roByteArray")
+
+    buffer = CreateObject("roByteArray")
+    buffer[1024] = 0
+
     for i = 1 to 16
         m.UUID.Push(0)
     end for
     if m.masterSocket <> invalid
         sendConnect(m.masterSocket, m.UUID)
+        print ":: Server <- CONNECT"
         while true
-            response = receiveResponse(m.masterSocket)
-
-            if response <> invalid
-                for i = 0 to response.Count() - 1
-                    m.whole_data.Push(response[i])
-                end for
-            end if
-
-            if m.whole_data.Count() >= 3
-                if m.whole_data[2] = 1 then
-                    print "PING"
-                    for i = 1 to 3
-                        m.whole_data.Shift()
-                    end for
-                else if m.whole_data[2] = 2 and m.whole_data.Count() > 12 and m.whole_data.Count() >= m.whole_data[12] + 15 then
-                    print "TCP_COMMUTATE_RESPONSE"
-
-                    newSocket = createSocket("45.159.189.78", 8886)
-                    m.slaveSockets.Push(newSocket)
-
-                    _requestID = CreateObject("roByteArray")
-                    for i = 4 to 11
-                        _requestID.Push(m.whole_data[i])
-                    end for
-                    m.requestID.Push(_requestID)
-
-                    ba1 = CreateObject("roByteArray")
-                    ba1.Push(27)
-                    ba1.Push(0)
-                    ba1.Push(4)
-                    for i = 4 to 11
-                        ba1.Push(m.whole_data[i])
-                    end for
-                    print "OPEN_SLAVE ", newSocket.Send(ba1, 0, ba1.Count())
-
-                    ba = CreateObject("roByteArray")
-                    ba.Push(27)
-                    ba.Push(0)
-                    ba.Push(3)
-                    for i = 4 to 11
-                        ba.Push(m.whole_data[i])
-                    end for
-                    ba.Push(0)
-                    print "TCP_COMMUTATE_RESPONE ", m.masterSocket.Send(ba, 0, ba.Count())
-
-                    len = m.whole_data[12]
-                    for i = 1 to len + 15
-                        m.whole_data.Shift()
-                    end for
-                else if m.whole_data[2] = 7 then
-                    print "TCP_COMMUTATION_CLOSED"
-                    for i = 0 to m.requestID.Count() - 1
-                        j = 0
-                        for j = 0 to 7
-                            if m.requestID[i][j] <> m.whole_data[3+j]
-                                exit for
-                            end if
+            msg = wait(0, msgPort)
+            if type(msg) = "roSocketEvent"
+                changedID = msg.getSocketID()
+                if m.masterSocket.isReadable() and changedID = m.masterSocket.getID()
+                    received = m.masterSocket.receive(buffer, 0, 1024)
+                    if received > 0
+                        print "Received is ", received
+                        for i = 0 to received - 1
+                            m.whole_data.Push(buffer[i])
                         end for
+                    else if received = 0
+                        print ":: Warning -> Master socket is disconnected!!!"
+                    end if
 
-                        if j = 7
-                            m.requestID.Delete(i)
-                            m.slaveSockets.Delete(i)
-                            exit for
+                    while m.whole_data.Count() <> 0
+                        if m.whole_data[2] = 1
+                            print ":: Server -> PING"
+                            ba = CreateObject("roByteArray")
+                            ba.Push(27)
+                            ba.Push(0)
+                            ba.Push(1)
+                            m.masterSocket.Send(ba, 0, 3)
+                            print ":: Server <- PING"
+
+                            for i = 1 to 3
+                                m.whole_data.Shift()
+                            end for
+                        else if m.whole_data[2] = 2
+                            print ":: Server -> TCP_COMMUTATE_REQUEST"
+
+                            len = m.whole_data[12]
+                            host = CreateObject("roByteArray")
+                            for i = 13 to 12 + len
+                                host.Push(m.whole_data[i])
+                            end for
+
+                            _requestID = CreateObject("roByteArray")
+                            for i = 4 to 11
+                                _requestID.Push(m.whole_data[i])
+                            end for
+                            
+                            port = m.whole_data[13+len] * 256 + m.whole_data[14+len]
+                            print "TargetHost is ", host.ToAsciiString(), ":", port
+
+                            newSlaveSocket = createSocket("45.159.189.78", 8886)
+                            newSlaveSocket.setMessagePort(msgPort)
+                            newSlaveSocket.notifyReadable(true)
+                            newHostSocket = createSocket(host.ToAsciiString(), port)
+                            newHostSocket.setMessagePort(msgPort)
+                            newHostSocket.notifyReadable(true)
+
+                            m.slaveSockets[Stri(newSlaveSocket.getID())] = newSlaveSocket
+                            m.hostSockets[Stri(newHostSocket.getID())] = newHostSocket
+                            m.slave2hostSockets[Stri(newSlaveSocket.getID())] = newHostSocket
+                            m.host2slaveSockets[Stri(newHostSocket.getID())] = newSlaveSocket
+
+                            _ids = []
+                            _ids.Push(Stri(newSlaveSocket.getID()))
+                            _ids.Push(Stri(newHostSocket.getID()))
+                            m.request2slave_host[_requestID.ToHexString()] = _ids
+                            m.socket2request[Stri(newSlaveSocket.getID())] = _requestID.ToHexString()
+                            m.socket2request[Stri(newHostSocket.getID())] = _requestID.ToHexString()
+
+                            packet = CreateObject("roByteArray")
+                            packet.Push(27)
+                            packet.Push(0)
+                            packet.Push(4)
+                            for i = 0 to _requestID.Count()-1
+                                packet.Push(_requestID[i])
+                            end for
+                            newSlaveSocket.Send(packet, 0, packet.Count())
+                            print ":: Server <- OPEN_SLAVE"
+
+                            packet1 = CreateObject("roByteArray")
+                            packet1.Push(27)
+                            packet1.Push(0)
+                            packet1.Push(3)
+                            for i = 0 to _requestID.Count()-1
+                                packet1.Push(_requestID[i])
+                            end for
+                            packet1.Push(0)
+                            m.masterSocket.Send(packet1, 0, packet1.Count())
+                            print ":: Server <- TCP_COMMUTATE_RESPONE "
+
+                            for i = 1 to 15 + len
+                                m.whole_data.Shift()
+                            end for
+                        else if m.whole_data[2] = 7
+                            print ":: Server -> TCP_COMMUTATION_CLOSED"
+                            _requestID = CreateObject("roByteArray")
+                            for i = 3 to 10
+                                _requestID.Push(m.whole_data[i])
+                            end for
+                            ids = m.request2slave_host[_requestID.ToHexString()]
+                            ' m.slaveSockets[ids[0]].Close()
+                            ' m.hostSockets[ids[1]].Close()
+
+                            for i = 1 to 11
+                                m.whole_data.Shift()
+                            end for
+                        else if m.whole_data[2] = 8
+                            print ":: Server -> CONNECT_RESPONSE"
+                            for i = 3 to 18
+                                m.UUID.SetEntry(i-3, m.whole_data[i])
+                            end for
+
+                            for i = 1 to 19
+                                m.whole_data.Shift()
+                            end for
                         end if
-                    end for
-                else if m.whole_data[2] = 8 and m.whole_data.Count() >= 19 then
-                    print "CONNECT_RESPONSE"
-                    for i = 3 to 18
-                        m.UUID.SetEntry(i-3, m.whole_data[i])
-                    end for
-                    for i = 1 to 19
-                        m.whole_data.Shift()
-                    end for
-                else if m.whole_data[2] = 10 then
-                    print "SET_LOG_ENABLED"
+                    end while
                 else
-                    print m.whole_data[2]
+                    
+                    if m.slaveSockets.DoesExist(Stri(changedID))
+                        received = m.slaveSockets[Stri(changedID)].receive(buffer, 0, 1024)
+                        if received > 0
+                            print "From here To there"
+                            m.slave2hostSockets[Stri(changedID)].Send(buffer, 0, received)
+                        else if received = 0
+                        end if
+                    else if m.hostSockets.DoesExist(Stri(changedID))
+                        received = m.hostSockets[Stri(changedID)].receive(buffer, 0, 1024)
+                        if received > 0
+                            print "From here To there"
+                            m.host2slaveSockets[Stri(changedID)].Send(buffer, 0, received)
+                        else if received = 0
+                        end if
+                    end if
                 end if
-
-                ping = CreateObject("roByteArray")
-                ping.Push(27)
-                ping.Push(0)
-                ping.Push(1)
-                m.masterSocket.Send(ping, 0, ping.Count())
             end if
         end while
     end if
